@@ -11,6 +11,7 @@ from app.intelligence import (
     build_phc_intelligence,
     find_stockout_risks,
     forecast_demand,
+    generate_redistribution_recommendations,
     risk_level,
 )
 
@@ -308,6 +309,18 @@ def simulate(req: SimulationRequest):
 
 @app.get("/api/recommendations")
 def recommendations():
+    """
+    Generate AI-assisted medicine redistribution recommendations.
+
+    The recommendation engine evaluates medicine-level stock,
+    projected seven-day demand, days of cover, stock-out risk,
+    and PHC operational risk before proposing transfers.
+    """
+
+    return generate_redistribution_recommendations(
+        df=df,
+        demand_multiplier=1.0,
+    )
 
     intelligence = pd.DataFrame(
         build_phc_intelligence(df)
