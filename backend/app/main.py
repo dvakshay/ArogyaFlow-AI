@@ -1,138 +1,376 @@
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
-import pandas as pd
-import numpy as np
-from sklearn.linear_model import LinearRegression
-from pathlib import Path
+
+from app.intelligence import (
+    build_phc_intelligence,
+    find_stockout_risks,
+    forecast_demand,
+    risk_level,
+)
+
 
 BASE = Path(__file__).resolve().parent.parent
 DATA = BASE / "data" / "phc_data.csv"
-DATA.parent.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="ArogyaFlow AI", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+MEDICINES = [
+    "Paracetamol",
+    "ORS",
+    "Amoxicillin",
+    "Azithromycin",
+    "IV Fluids",
+]
 
-MEDICINES = ["Paracetamol", "ORS", "Amoxicillin", "Azithromycin", "IV Fluids"]
+
+app = FastAPI(
+    title="ArogyaFlow AI",
+    description="Predictive health-resource resilience platform for PHCs.",
+    version="1.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 class SimulationRequest(BaseModel):
     outbreak: bool = True
     demand_multiplier: float = 1.35
 
 
-def make_data():
-    rng = np.random.default_rng(42)
-    states = ["Telangana", "Andhra Pradesh", "Odisha"]
-    districts = ["Hyderabad", "Warangal", "Visakhapatnam", "Guntur", "Koraput", "Cuttack"]
-    rows = []
-    for i in range(48):
-        district = districts[i % len(districts)]
-        state = states[districts.index(district) % len(states)]
-        lat = 17.2 + (i % 8) * 0.28
-        lon = 78.2 + (i % 6) * 0.42
-        beds = int(rng.integers(12, 41))
-        staff = int(rng.integers(4, 13))
-        utilization = float(rng.uniform(0.35, 0.95))
-        for medicine in MEDICINES:
-            base = {"Paracetamol": 520, "ORS": 380, "Amoxicillin": 250, "Azithromycin": 190, "IV Fluids": 310}[medicine]
-            demand = max(25, base * utilization + rng.normal(0, base * 0.08))
-            stock_days = float(rng.uniform(2.0, 18.0))
-            stock = int(demand * stock_days)
-            rows.append({"phc_id": f"PHC-{i+1:03d}", "district": district, "state": state, "latitude": lat, "longitude": lon, "beds": beds, "staff": staff, "utilization": round(utilization, 3), "medicine": medicine, "stock": stock, "daily_demand": round(demand, 1), "stock_days": round(stock_days, 1)})
-    return pd.DataFrame(rows)
-
 if DATA.exists():
     df = pd.read_csv(DATA)
 else:
-    df = make_data()
-    df.to_csv(DATA, index=False)
+    raise FileNotFoundError(
+        f"PHC dataset not found at {DATA}"
+    )
 
-
-def analyze(multiplier=1.0):
-    grouped = []
-    for phc_id, g in df.groupby("phc_id"):
-        demand = g["daily_demand"].sum() / len(g)
-        weighted_stock_days = (g["stock_days"] * g["daily_demand"]).sum() / g["daily_demand"].sum()
-        risk = min(99, max(4, (7 - weighted_stock_days) * 12 + (g["utilization"].iloc[0] - .5) * 35))
-        if multiplier > 1:
-            risk = min(99, risk + (multiplier - 1) * 42)
-        grouped.append({
-            "phc_id": phc_id, "district": g["district"].iloc[0], "state": g["state"].iloc[0],
-            "latitude": g["latitude"].iloc[0], "longitude": g["longitude"].iloc[0],
-            "beds": int(g["beds"].iloc[0]), "staff": int(g["staff"].iloc[0]),
-            "utilization": round(float(g["utilization"].iloc[0]) * 100, 1),
-            "avg_stock_days": round(float(weighted_stock_days), 1), "risk": round(float(risk), 1)
-        })
-    return pd.DataFrame(grouped)
-
-
-def level(risk):
-    return "Critical" if risk >= 75 else "High" if risk >= 50 else "Watch" if risk >= 30 else "Stable"
 
 @app.get("/")
 def root():
-    return {"name": "ArogyaFlow AI", "status": "operational", "version": "1.0.0"}
+    return {
+        "name": "ArogyaFlow AI",
+        "status": "operational",
+        "version": "1.1.0",
+        "description": "Predictive PHC health-resource resilience platform",
+    }
+
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "service": "arogyaflow-backend",
+    }
+
 
 @app.get("/api/summary")
 def summary():
-    a = analyze()
+
+    intelligence = pd.DataFrame(
+        build_phc_intelligence(df)
+    )
+
     return {
-        "phcs": int(len(a)), "critical": int((a.risk >= 75).sum()), "high_risk": int(((a.risk >= 50) & (a.risk < 75)).sum()),
-        "avg_utilization": round(float(a.utilization.mean()), 1), "beds_available": int((df["beds"] * (1-df["utilization"])).groupby(df["phc_id"]).first().sum()),
-        "last_updated": "Live simulation"
+        "phcs": int(len(intelligence)),
+        "critical": int(
+            (intelligence["risk"] >= 75).sum()
+        ),
+        "high_risk": int(
+            (
+                (intelligence["risk"] >= 50)
+                & (intelligence["risk"] < 75)
+            ).sum()
+        ),
+        "watch": int(
+            (
+                (intelligence["risk"] >= 30)
+                & (intelligence["risk"] < 50)
+            ).sum()
+        ),
+        "stable": int(
+            (intelligence["risk"] < 30).sum()
+        ),
+        "avg_utilization": round(
+            float(intelligence["utilization"].mean()),
+            1,
+        ),
+        "beds_available": int(
+            (
+                df["beds"]
+                * (1 - df["utilization"])
+            )
+            .groupby(df["phc_id"])
+            .first()
+            .sum()
+        ),
+        "last_updated": "Live simulation",
     }
+
 
 @app.get("/api/phcs")
 def phcs():
-    a = analyze()
-    records = a.to_dict(orient="records")
-    for x in records: x["status"] = level(x["risk"])
-    return records
+
+    return build_phc_intelligence(df)
+
+
+@app.get("/api/intelligence")
+def intelligence():
+
+    records = build_phc_intelligence(df)
+
+    return {
+        "total_phcs": len(records),
+        "critical": [
+            item
+            for item in records
+            if item["risk"] >= 75
+        ],
+        "high_risk": [
+            item
+            for item in records
+            if 50 <= item["risk"] < 75
+        ],
+        "watch": [
+            item
+            for item in records
+            if 30 <= item["risk"] < 50
+        ],
+    }
+
 
 @app.get("/api/medicines")
 def medicines():
-    out = []
-    for med, g in df.groupby("medicine"):
-        stock = int(g.stock.sum())
-        daily = float(g.daily_demand.sum())
-        days = stock / max(daily, 1)
-        risk = min(99, max(3, (7 - days) * 14))
-        forecast = daily * 7
-        out.append({"medicine": med, "stock": stock, "daily_demand": round(daily,1), "days_cover": round(days,1), "forecast_7d": round(forecast,0), "risk": round(risk,1), "status": level(risk)})
-    return out
+
+    output = []
+
+    for medicine, group in df.groupby("medicine"):
+
+        stock = float(group["stock"].sum())
+        daily_demand = float(
+            group["daily_demand"].sum()
+        )
+
+        analysis = {
+            "stock": stock,
+            "daily_demand": daily_demand,
+        }
+
+        days_cover = (
+            stock / max(daily_demand, 1)
+        )
+
+        if days_cover <= 2:
+            risk = 95
+        elif days_cover <= 4:
+            risk = 82
+        elif days_cover <= 7:
+            risk = 65
+        elif days_cover <= 10:
+            risk = 40
+        else:
+            risk = 15
+
+        forecast = forecast_demand(
+            daily_demand,
+            days=7,
+        )
+
+        output.append(
+            {
+                "medicine": medicine,
+                "stock": int(stock),
+                "daily_demand": round(
+                    daily_demand,
+                    1,
+                ),
+                "days_cover": round(
+                    days_cover,
+                    1,
+                ),
+                "forecast_7d": round(
+                    forecast["total_forecast"],
+                    0,
+                ),
+                "risk": risk,
+                "status": risk_level(risk),
+            }
+        )
+
+    return output
+
+
+@app.get("/api/stockouts")
+def stockouts():
+
+    risks = find_stockout_risks(df)
+
+    return {
+        "count": len(risks),
+        "items": risks[:30],
+    }
+
 
 @app.get("/api/forecast/{phc_id}")
-def forecast(phc_id: str, medicine: Optional[str] = "Paracetamol"):
-    g = df[(df.phc_id == phc_id) & (df.medicine == medicine)]
-    if g.empty: return {"error": "PHC or medicine not found"}
-    base = float(g.daily_demand.iloc[0])
-    history = [round(max(10, base * (0.82 + i*0.025) + np.sin(i)*base*.04), 1) for i in range(14)]
-    x = np.arange(len(history)).reshape(-1,1)
-    model = LinearRegression().fit(x, np.array(history))
-    future_x = np.arange(14,21).reshape(-1,1)
-    pred = model.predict(future_x).clip(min=0)
-    return {"phc_id": phc_id, "medicine": medicine, "history": history, "forecast": [round(float(v),1) for v in pred], "model": "Linear trend + operational risk engine"}
+def forecast(
+    phc_id: str,
+    medicine: Optional[str] = "Paracetamol",
+):
+
+    group = df[
+        (df["phc_id"] == phc_id)
+        & (df["medicine"] == medicine)
+    ]
+
+    if group.empty:
+        return {
+            "error": "PHC or medicine not found"
+        }
+
+    base_demand = float(
+        group["daily_demand"].iloc[0]
+    )
+
+    result = forecast_demand(
+        base_daily_demand=base_demand,
+        days=7,
+    )
+
+    return {
+        "phc_id": phc_id,
+        "medicine": medicine,
+        "history": result["history"],
+        "forecast": result["forecast"],
+        "total_forecast": result["total_forecast"],
+        "model": "Linear demand forecasting model",
+    }
+
 
 @app.post("/api/simulate")
 def simulate(req: SimulationRequest):
-    a = analyze(req.demand_multiplier if req.outbreak else 1.0)
-    critical = a[a.risk >= 75].sort_values("risk", ascending=False).head(8)
-    return {"outbreak": req.outbreak, "demand_multiplier": req.demand_multiplier, "critical_phcs": [{**x, "status": level(x["risk"])} for x in critical.to_dict(orient="records")], "critical_count": int((a.risk >= 75).sum())}
+
+    multiplier = (
+        req.demand_multiplier
+        if req.outbreak
+        else 1.0
+    )
+
+    intelligence = build_phc_intelligence(
+        df,
+        demand_multiplier=multiplier,
+    )
+
+    critical = sorted(
+        intelligence,
+        key=lambda item: item["risk"],
+        reverse=True,
+    )
+
+    critical = [
+        item
+        for item in critical
+        if item["risk"] >= 75
+    ][:10]
+
+    stockouts = find_stockout_risks(
+        df,
+        demand_multiplier=multiplier,
+    )
+
+    return {
+        "outbreak": req.outbreak,
+        "demand_multiplier": multiplier,
+        "critical_count": len(
+            [
+                item
+                for item in intelligence
+                if item["risk"] >= 75
+            ]
+        ),
+        "critical_phcs": critical,
+        "stockout_risks": stockouts[:15],
+        "message": (
+            "Emergency demand simulation completed. "
+            "Prioritize critical PHCs and redistribute "
+            "resources from lower-risk facilities."
+        ),
+    }
+
 
 @app.get("/api/recommendations")
 def recommendations():
-    a = analyze().sort_values("risk", ascending=False)
-    donors = a[a.risk < 30].head(6).reset_index(drop=True)
-    receivers = a[a.risk >= 60].head(6).reset_index(drop=True)
-    recs = []
-    for i, r in receivers.iterrows():
-        d = donors.iloc[i % len(donors)] if len(donors) else None
-        if d is not None:
-            qty = int(250 + (r.risk - 60) * 12)
-            recs.append({"from_phc": d.phc_id, "from_district": d.district, "to_phc": r.phc_id, "to_district": r.district, "medicine": MEDICINES[i % len(MEDICINES)], "quantity": qty, "priority": "Urgent" if r.risk >= 75 else "High", "reason": f"{r.phc_id} has {r.avg_stock_days} days of cover and {r.risk}% predicted risk."})
-    return recs
+
+    intelligence = pd.DataFrame(
+        build_phc_intelligence(df)
+    )
+
+    donors = intelligence[
+        intelligence["risk"] < 30
+    ].sort_values(
+        "avg_stock_days",
+        ascending=False,
+    )
+
+    receivers = intelligence[
+        intelligence["risk"] >= 60
+    ].sort_values(
+        "risk",
+        ascending=False,
+    )
+
+    recommendations = []
+
+    for index, (_, receiver) in enumerate(
+        receivers.head(8).iterrows()
+    ):
+
+        if donors.empty:
+            break
+
+        donor = donors.iloc[
+            index % len(donors)
+        ]
+
+        medicine = MEDICINES[
+            index % len(MEDICINES)
+        ]
+
+        quantity = int(
+            250
+            + (
+                receiver["risk"] - 60
+            ) * 12
+        )
+
+        recommendations.append(
+            {
+                "from_phc": donor["phc_id"],
+                "from_district": donor["district"],
+                "to_phc": receiver["phc_id"],
+                "to_district": receiver["district"],
+                "medicine": medicine,
+                "quantity": quantity,
+                "priority": (
+                    "Urgent"
+                    if receiver["risk"] >= 75
+                    else "High"
+                ),
+                "reason": (
+                    f'{receiver["phc_id"]} has '
+                    f'{receiver["avg_stock_days"]} days '
+                    f'of stock cover and '
+                    f'{receiver["risk"]}% operational risk.'
+                ),
+            }
+        )
+
+    return recommendations
