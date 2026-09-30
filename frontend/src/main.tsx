@@ -36,7 +36,7 @@ import {
 // @ts-expect-error CSS is loaded by the bundler; TypeScript may not have CSS module declarations.
 import "./styles.css";
 
-const API = "http://127.0.0.1:8000";
+const API_URL = "https://arogyaflow-ai-backend.onrender.com";
 
 type Summary = {
   phcs: number;
